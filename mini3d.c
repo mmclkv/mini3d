@@ -24,11 +24,21 @@
 
 typedef unsigned int IUINT32;
 
+#define RENDER_STATE_WIREFRAME      1		// 渲染线框
+#define RENDER_STATE_TEXTURE        2		// 渲染纹理
+#define RENDER_STATE_COLOR          4		// 渲染颜色
+#define NEAR_PLANE                  1.0f    // 视锥体近平面深度
+#define FAR_PLANE                   500.f   // 视锥体远平面深度
+
 //=====================================================================
 // 数学库：此部分应该不用详解，熟悉 D3D 矩阵变换即可
 //=====================================================================
 typedef struct { float m[4][4]; } matrix_t;
-typedef struct { float x, y, z, w; } vector_t;
+
+typedef struct { 
+	float x, y, z, w; 
+} vector_t;
+
 typedef vector_t point_t;
 
 int CMID(int x, int min, int max) { return (x < min)? min : ((x > max)? max : x); }
@@ -56,6 +66,13 @@ void vector_sub(vector_t *z, const vector_t *x, const vector_t *y) {
 	z->y = x->y - y->y;
 	z->z = x->z - y->z;
 	z->w = 1.0;
+}
+
+void point_sub(vector_t *z, const point_t *x, const point_t *y) {
+	z->x = x->x - y->x;
+	z->y = x->y - y->y;
+	z->z = x->z - y->z;
+	z->w = 0.0;
 }
 
 // 矢量点乘
@@ -265,7 +282,7 @@ void transform_init(transform_t *ts, int width, int height) {
 	float aspect = (float)width / ((float)height);
 	matrix_set_identity(&ts->world);
 	matrix_set_identity(&ts->view);
-	matrix_set_perspective(&ts->projection, 3.1415926f * 0.5f, aspect, 1.0f, 500.0f);
+	matrix_set_perspective(&ts->projection, 3.1415926f * 0.5f, aspect, NEAR_PLANE, FAR_PLANE);
 	ts->w = (float)width;
 	ts->h = (float)height;
 	transform_update(ts);
@@ -304,7 +321,7 @@ void transform_homogenize(const transform_t *ts, vector_t *y, const vector_t *x)
 //=====================================================================
 typedef struct { float r, g, b; } color_t;
 typedef struct { float u, v; } texcoord_t;
-typedef struct { point_t pos; texcoord_t tc; color_t color; float rhw; } vertex_t;
+typedef struct { point_t pos; texcoord_t tc; color_t color; float rhw; float light; } vertex_t;
 
 typedef struct { vertex_t v, v1, v2; } edge_t;
 typedef struct { float top, bottom; edge_t left, right; } trapezoid_t;
@@ -329,6 +346,7 @@ void vertex_interp(vertex_t *y, const vertex_t *x1, const vertex_t *x2, float t)
 	y->color.g = interp(x1->color.g, x2->color.g, t);
 	y->color.b = interp(x1->color.b, x2->color.b, t);
 	y->rhw = interp(x1->rhw, x2->rhw, t);
+	y->light = interp(x1->light, x2->light, t);
 }
 
 void vertex_division(vertex_t *y, const vertex_t *x1, const vertex_t *x2, float w) {
@@ -343,6 +361,7 @@ void vertex_division(vertex_t *y, const vertex_t *x1, const vertex_t *x2, float 
 	y->color.g = (x2->color.g - x1->color.g) * inv;
 	y->color.b = (x2->color.b - x1->color.b) * inv;
 	y->rhw = (x2->rhw - x1->rhw) * inv;
+	y->light = (x2->light - x1->light) * inv;
 }
 
 void vertex_add(vertex_t *y, const vertex_t *x) {
@@ -464,9 +483,10 @@ typedef struct {
 	IUINT32 foreground;         // 线框颜色
 }	device_t;
 
-#define RENDER_STATE_WIREFRAME      1		// 渲染线框
-#define RENDER_STATE_TEXTURE        2		// 渲染纹理
-#define RENDER_STATE_COLOR          4		// 渲染颜色
+IUINT32 reflectIndex;//反射指数
+float ambientLightIntensity, lightIntensity, diffuseRate, specularRate;//环境光强度, 平行光源光强度, 漫反射系数, 镜面反射系数
+vector_t lightDirection, upDirection, viewDirection;//平行光源方向, 视线法向量，视线方向，变换后的视线方向
+point_t cameraPosition, viewPosition;//摄影机位置，视点位置
 
 // 设备初始化，fb为外部帧缓存，非 NULL 将引用外部帧缓存（每行 4字节对齐）
 void device_init(device_t *device, int width, int height, void *fb) {
@@ -497,7 +517,7 @@ void device_init(device_t *device, int width, int height, void *fb) {
 	device->max_v = 1.0f;
 	device->width = width;
 	device->height = height;
-	device->background = 0xc0c0c0;
+	device->background = 0xcc6600;
 	device->foreground = 0;
 	transform_init(&device->transform, width, height);
 	device->render_state = RENDER_STATE_WIREFRAME;
@@ -514,7 +534,7 @@ void device_destroy(device_t *device) {
 
 // 设置当前纹理
 void device_set_texture(device_t *device, void *bits, long pitch, int w, int h) {
-	char *ptr = (char*)bits;
+	IUINT32 *ptr = (IUINT32*)bits;
 	int j;
 	assert(w <= 1024 && h <= 1024);
 	for (j = 0; j < h; ptr += pitch, j++) 	// 重新计算每行纹理的指针
@@ -639,7 +659,9 @@ void device_draw_scanline(device_t *device, scanline_t *scanline) {
 					float u = scanline->v.tc.u * w;
 					float v = scanline->v.tc.v * w;
 					IUINT32 cc = device_texture_read(device, u, v);
-					framebuffer[x] = cc;
+					framebuffer[x] = ((int)((cc >> 16) * scanline->v.light) << 16) +
+						             ((int)(((cc & 65535)>> 8) * scanline->v.light) << 8) +
+									 (int)((cc & 255) * scanline->v.light);
 				}
 			}
 		}
@@ -666,9 +688,87 @@ void device_render_trap(device_t *device, trapezoid_t *trap) {
 
 // 根据 render_state 绘制原始三角形
 void device_draw_primitive(device_t *device, const vertex_t *v1, 
-	const vertex_t *v2, const vertex_t *v3) {
+	const vertex_t *v2, const vertex_t *v3, const vector_t *normal) {
 	point_t p1, p2, p3, c1, c2, c3;
+	vector_t trans_normal, trans_revViewDirection, 
+		     trans_revLightDirection, trans_reflectDirection;
 	int render_state = device->render_state;
+	matrix_t normal_transform;
+	float ln;
+	vector_t nnl;
+	float t1_light, t2_light, t3_light;
+
+	//变换图元法向量(旋转变换+摄影机变换)
+	matrix_mul(&normal_transform, &device->transform.world, &device->transform.view);
+	matrix_apply(&trans_normal, normal, &normal_transform);
+
+	vector_normalize(&trans_normal);
+
+	//变换光线方向(摄影机变换)
+	matrix_apply(&trans_revLightDirection, &lightDirection, &device->transform.view);
+	trans_revLightDirection.x = -trans_revLightDirection.x;
+	trans_revLightDirection.y = -trans_revLightDirection.y;
+	trans_revLightDirection.z = -trans_revLightDirection.z;
+
+	vector_normalize(&trans_revLightDirection);
+
+	ln = vector_dotproduct(&trans_revLightDirection, &trans_normal);
+	nnl.x = 2 * ln * trans_normal.x;
+	nnl.y = 2 * ln * trans_normal.y;
+	nnl.z = 2 * ln * trans_normal.z;
+	nnl.w = 0;
+	vector_sub(&trans_reflectDirection, &nnl, &trans_revLightDirection);
+
+	vector_normalize(&trans_reflectDirection);
+
+	//计算能进入人眼的反射光方向
+	c1.x = NEAR_PLANE * v1->pos.x / v1->pos.z;
+	c1.y = NEAR_PLANE * v1->pos.y / v1->pos.z;
+	c1.z = NEAR_PLANE;
+	c1.w = 1;
+
+	point_sub(&trans_revViewDirection, &c1, &v1->pos);
+	
+	vector_normalize(&trans_revViewDirection);
+	
+	t1_light = ambientLightIntensity + lightIntensity * (diffuseRate * ln + 
+		                                             specularRate * 
+							     pow(vector_dotproduct(&trans_reflectDirection, &trans_revViewDirection), (float)reflectIndex));
+	
+	if (t1_light < ambientLightIntensity) t1_light = ambientLightIntensity;
+	else if (t1_light > 1) t1_light = 1;
+	
+	c2.x = NEAR_PLANE * v2->pos.x / v2->pos.z;
+	c2.y = NEAR_PLANE * v2->pos.y / v2->pos.z;
+	c2.z = NEAR_PLANE;
+	c2.w = 1;
+
+	point_sub(&trans_revViewDirection, &c2, &v2->pos);
+	
+	vector_normalize(&trans_revViewDirection);
+	
+	t2_light = ambientLightIntensity + lightIntensity * (diffuseRate * ln + 
+		                                             specularRate * 
+						             pow(vector_dotproduct(&trans_reflectDirection, &trans_revViewDirection), (float)reflectIndex));
+
+	if (t2_light < ambientLightIntensity) t2_light = ambientLightIntensity;
+	else if (t2_light > 1) t2_light = 1;
+
+	c3.x = NEAR_PLANE * v3->pos.x / v3->pos.z;
+	c3.y = NEAR_PLANE * v3->pos.y / v3->pos.z;
+	c3.z = NEAR_PLANE;
+	c3.w = 1;
+
+	point_sub(&trans_revViewDirection, &c3, &v3->pos);
+	
+	vector_normalize(&trans_revViewDirection);
+	
+	t3_light = ambientLightIntensity + lightIntensity * (diffuseRate * ln + 
+		                                             specularRate * 
+							     pow(vector_dotproduct(&trans_reflectDirection, &trans_revViewDirection), (float)reflectIndex));
+
+	if (t3_light < ambientLightIntensity) t3_light = ambientLightIntensity;
+	else if (t3_light > 1) t3_light = 1;
 
 	// 按照 Transform 变化
 	transform_apply(&device->transform, &c1, &v1->pos);
@@ -698,6 +798,9 @@ void device_draw_primitive(device_t *device, const vertex_t *v1,
 		t1.pos.w = c1.w;
 		t2.pos.w = c2.w;
 		t3.pos.w = c3.w;
+		t1.light = t1_light;
+		t2.light = t2_light;
+		t3.light = t3_light;
 		
 		vertex_rhw_init(&t1);	// 初始化 w
 		vertex_rhw_init(&t2);	// 初始化 w
@@ -861,30 +964,39 @@ vertex_t mesh[8] = {
 	{ {  1,  1, -1, 1 }, { 1, 0 }, { 0.2f, 1.0f, 0.3f }, 1 },
 };
 
-void draw_plane(device_t *device, int a, int b, int c, int d) {
+vector_t nor[6] = {{0, 0, 1, 0}, {0, 0, -1, 0}, {0, -1, 0, 0}, 
+	               {-1, 0, 0, 0}, {0, 1, 0, 0}, {1, 0, 0, 0}};
+
+void draw_plane(device_t *device, int a, int b, int c, int d, vector_t normal) {
 	vertex_t p1 = mesh[a], p2 = mesh[b], p3 = mesh[c], p4 = mesh[d];
 	p1.tc.u = 0, p1.tc.v = 0, p2.tc.u = 0, p2.tc.v = 1;
 	p3.tc.u = 1, p3.tc.v = 1, p4.tc.u = 1, p4.tc.v = 0;
-	device_draw_primitive(device, &p1, &p2, &p3);
-	device_draw_primitive(device, &p3, &p4, &p1);
+	device_draw_primitive(device, &p1, &p2, &p3, &normal);
+	device_draw_primitive(device, &p3, &p4, &p1, &normal);
 }
 
 void draw_box(device_t *device, float theta) {
 	matrix_t m;
-	matrix_set_rotate(&m, -1, -0.5, 1, theta);
+
+	matrix_set_rotate(&m, -1, 1, 1, theta);
 	device->transform.world = m;
 	transform_update(&device->transform);
-	draw_plane(device, 0, 1, 2, 3);
-	draw_plane(device, 4, 5, 6, 7);
-	draw_plane(device, 0, 4, 5, 1);
-	draw_plane(device, 1, 5, 6, 2);
-	draw_plane(device, 2, 6, 7, 3);
-	draw_plane(device, 3, 7, 4, 0);
+	
+	draw_plane(device, 0, 1, 2, 3, nor[0]);
+	draw_plane(device, 4, 5, 6, 7, nor[1]);
+	draw_plane(device, 5, 1, 0, 4, nor[2]);
+	draw_plane(device, 1, 5, 6, 2, nor[3]);
+	draw_plane(device, 2, 6, 7, 3, nor[4]);
+	draw_plane(device, 3, 7, 4, 0, nor[5]);
 }
 
 void camera_at_zero(device_t *device, float x, float y, float z) {
-	point_t eye = { x, y, z, 1 }, at = { 0, 0, 0, 1 }, up = { 0, 0, 1, 1 };
-	matrix_set_lookat(&device->transform.view, &eye, &at, &up);
+	point_t eye = {x, y, z, 1}, at = {0, 0, 0, 1}, up = {0, 1, 0, 0};
+	cameraPosition = eye;
+	viewPosition = at;
+	upDirection = up;
+	point_sub(&viewDirection, &viewPosition, &cameraPosition);
+	matrix_set_lookat(&device->transform.view, &cameraPosition, &viewPosition, &upDirection);
 	transform_update(&device->transform);
 }
 
@@ -897,7 +1009,34 @@ void init_texture(device_t *device) {
 			texture[j][i] = ((x + y) & 1)? 0xffffff : 0x3fbcef;
 		}
 	}
-	device_set_texture(device, texture, 256 * 4, 256, 256);
+	device_set_texture(device, texture, 256, 256, 256);
+}
+
+void setAmbientLightIntensity(float intensity) {
+	ambientLightIntensity = intensity;
+}
+
+void setLightDirection(float x, float y, float z) {
+	lightDirection.x = x;
+	lightDirection.y = y;
+	lightDirection.z = z;
+	lightDirection.w = 0;
+}
+
+void setLightIntensity(float value) {
+	lightIntensity = value;
+}
+
+void setReflectIndex(IUINT32 n) {
+	reflectIndex = n;
+}
+
+void setDiffuseRate(float r) {
+	diffuseRate = r;
+}
+
+void setSpecularRate(float r) {
+	specularRate = r;
 }
 
 int main(void)
@@ -905,9 +1044,9 @@ int main(void)
 	device_t device;
 	int states[] = { RENDER_STATE_TEXTURE, RENDER_STATE_COLOR, RENDER_STATE_WIREFRAME };
 	int indicator = 0;
-	int kbhit = 0;
-	float alpha = 1;
-	float pos = 3.5;
+	int kbhit = 0;//用于保证当空格键被持续按下时，显示模式只切换一次
+	float alpha = 0;
+	float pos = 5.5;
 
 	TCHAR *title = _T("Mini3d (software render tutorial) - ")
 		_T("Left/Right: rotation, Up/Down: forward/backward, Space: switch state");
@@ -916,14 +1055,19 @@ int main(void)
 		return -1;
 
 	device_init(&device, 800, 600, screen_fb);
-	camera_at_zero(&device, 3, 0, 0);
 
+	setAmbientLightIntensity(0.25f);
+	setLightDirection(-1, 0, 0);
+	setLightIntensity(1.0);
+	setReflectIndex(300);
+	setDiffuseRate(0.6f);
+	setSpecularRate(0.15f);
 	init_texture(&device);
 	device.render_state = RENDER_STATE_TEXTURE;
 
 	while (screen_exit == 0 && screen_keys[VK_ESCAPE] == 0) {
 		screen_dispatch();
-		device_clear(&device, 1);
+		device_clear(&device, 0);
 		camera_at_zero(&device, pos, 0, 0);
 		
 		if (screen_keys[VK_UP]) pos -= 0.01f;
